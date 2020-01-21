@@ -31,25 +31,32 @@ Contents
 
    If the obfuscated script has been expired, it will raise exception
    and quit directly. All the code in the obfuscated script will not
-   run, so this function will not return 0.
+   run, so this function will never return 0.
 
 .. function:: get_license_info()
 
    Get license information of obfuscated scripts.
 
-   It returns a dict with keys *expired*, *CODE*, *IFMAC*.
+   It returns a dict with keys:
 
-   The value of *expired* is == -1 means no time limitation.
+   * expired: Expired date
+   * IFMAC: mac address bind to this license
+   * HARDDISK: serial number of harddisk bind to this license
+   * IPV4: ipv4 address bind to this license
+   * DATA: any data stored in this licese, used by extending license type
+   * CODE: registration code of this license
 
-   Raise :exc:`PytransformError` if license is invalid, for example,
-   it has been expired.
+   The value `None` means no this key in the license.
+
+   Raise :exc:`Exception` if license is invalid, for example, it has
+   been expired.
 
 .. function:: get_license_code()
 
    Return a string, which is specified as generating the licenses for
    obfucated scripts.
 
-   Raise :exc:`PytransformError` if license is invalid.
+   Raise :exc:`Exception` if license is invalid.
 
 .. function:: get_hd_info(hdtype, size=256)
 
@@ -59,7 +66,7 @@ Contents
 
    *HT_IFMAC* return mac address of first network card
 
-   Raise :exc:`PytransformError` if something is wrong.
+   Raise :exc:`Exception` if something is wrong.
 
 .. attribute:: HT_HARDDISK, HT_IFMAC
 
@@ -83,49 +90,15 @@ Show left days of license
            print('This license for %s is never expired' % code)
        else:
            print('This license for %s will be expired in %d days' % (code, left_days))
-   except PytransformError as e:
+   except Exception as e:
        print(e)
 
-Double check harddisk information
-
-.. code-block:: python
-
-   from pytransform import get_hd_info, get_license_code, HT_IFMAC
-   expected_mac_address = get_license_code().split('-')[1]
-   if get_hd_info(HT_IFMAC) != expected_mac_address:
-       sys.exit(1)
-
-Then generate one expired license file for this obfuscated script
-
-.. code-block:: shell
-
-   pyarmor licenses -e 2020-01-01 MAC-70:f1:a1:23:f0:94
-
-Check internet time by NTP server
-
-.. code-block:: python
-
-    from ntplib import NTPClient
-    from time import mktime, strptime
-    from pytransform import get_license_code
-
-    NTP_SERVER = 'europe.pool.ntp.org'
-    EXPIRED_DATE = get_license_code()[4:]
-
-    c = NTPClient()
-    response = c.request(NTP_SERVER, version=3)
-    if response.tx_time > mktime(strptime(EXPIRED_DATE, '%Y-%m-%d')):
-        sys.exit(1)
-
-Also save the expired date in the license file, generate it by this command
-
-.. code-block:: shell
-
-   pyarmor licenses NTP-2020-01-01
+More usage refer to :ref:`Using Plugin to Extend License Type`
 
 .. note::
 
-   For security, it's better to move the source of `get_license_code`
-   and `NTPClient` into the obfuscated scripts.
+   Though `pytransform.py` is not obfuscated when running the obfuscated script,
+   it's also protected by `PyArmor`. If it's changed, the obfuscated script will
+   raise protection exception.
 
-   Refer to :ref:`Using Plugin to Extend License Type`
+   Refer to :ref:`special handling of entry script`

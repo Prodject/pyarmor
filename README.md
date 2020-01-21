@@ -1,8 +1,8 @@
 # PyArmor
 
-* [Homepage](http://pyarmor.dashingsoft.com) ([中文版网站](http://pyarmor.dashingsoft.com/index-zh.html))
+* [Homepage](https://pyarmor.dashingsoft.com) ([中文版网站](https://pyarmor.dashingsoft.com/index-zh.html))
 * [Documentation](https://pyarmor.readthedocs.io/en/latest/)
-* [WebUI Demo](http://pyarmor.dashingsoft.com/demo/index.html)
+* [WebUI Demo](https://pyarmor.dashingsoft.com/demo/index.html)
 * [Examples](src/examples)
 
 PyArmor is a command line tool used to obfuscate python scripts, bind
@@ -14,7 +14,7 @@ protects Python scripts by the following ways:
 * Clear f_locals of frame as soon as code object completed execution.
 * Verify the license file of obfuscated scripts while running it.
 
-Refer to [Protect Python Scripts By PyArmor](docs/protect-python-scripts-by-pyarmor.md)
+Refer to [How PyArmor Does It](https://pyarmor.readthedocs.io/en/latest/how-to-do.html)
 
 ## Support Platforms
 
@@ -32,70 +32,65 @@ Installation
 
 Obfuscate scripts
 
-    pyarmor obfuscate examples/simple/queens.py
+    pyarmor obfuscate foo.py
 
 Run obfuscated scripts
 
     cd dist
-    python queens.py
+    python foo.py
 
-Pack obfuscated scripts with `PyInstaller`, `py2exe`, `cx_Freeze` etc.
+Pack obfuscated scripts into one bundle
 
     pip install pyinstaller
-    pyarmor pack examples/py2exe/hello.py
+    pyarmor pack foo.py
 
 Generate an expired license and run obfuscated scripts with new license
 
-    pyarmor licenses --expired 2018-12-31 Customer-Jondy
-    cp licenses/Customer-Jondy/license.lic dist/
+    pyarmor licenses --expired 2018-12-31 PRODUCT-SN-0001
+    cp licenses/PRODUCT-SN-0001/license.lic dist/pytransform/
 
     cd dist/
-    python queens.py
+    python foo.py
 
 Start webui, open web page in browser for basic usage of PyArmor
 
     pyarmor-webui
 
-More usage, refer to [Examples](src/examples/README.md), [Documentation](https://pyarmor.readthedocs.io/en/latest/)
+More usage, refer to 
+
+* [Examples](src/examples/README.md)
+* [Documentation](https://pyarmor.readthedocs.io/en/latest/)
 
 ## License
 
-PyArmor is published as shareware. Free trial version never expires, the limitations are
+PyArmor is published as shareware, free trial version never expires, but there are
+some limitations:
 
-- The maximum size of code object is 35728 bytes in trial version
-- The scripts obfuscated by trial version are not private. It means
-  anyone could generate the license file which works for these
-  obfuscated scripts.
+* The maximum size of code object is 35728 bytes in trial version
+* All the trial version uses same public capsule other than private capsule
+* ...
 
-About the license file of obfuscated scripts, refer to [The License File for Obfuscated Script](https://pyarmor.readthedocs.io/en/latest/understand-obfuscated-scripts.html#the-license-file-for-obfuscated-script)
-
-A registration code is required to obfuscate big code object or
-generate private obfuscated scripts.
-
-- Personal user: one registration code is enough.
-- Company user: one registration code is only used for one project/product.
-
-For details, refer to [About License](https://pyarmor.readthedocs.io/en/latest/license.html).
+For details, refer to [PyArmor License](https://pyarmor.readthedocs.io/en/latest/license.html).
 
 ### Purchase
 
 Click [Purchase](https://order.shareit.com/cart/add?vendorid=200089125&PRODUCT[300871197]=1),
 
-A registration code will be sent to your immediately after payment is completed successfully.
+A registration keyfile generally named "pyarmor-regfile-1.zip" will be sent to
+your by email immediately after payment is completed successfully. There are 3
+files in the archive:
 
-After you receive the email which includes registration code, run the
-following command to make it effective::
+* REAME.txt
+* license.lic (registration code)
+* .pyarmor_capsule.zip (private capsule)
 
-    pyarmor register CODE
+Run the following command to take this keyfile effects:
 
-Note that command `register` is introduced from `PyArmor` 5.3.3,
-please upgrade the old version to the latest one, or directly replace
-the content of `license.lic` in the `PyArmor` installed path with the
-registration code only (no newline).
+    pyarmor register /path/to/pyarmor-regfile-1.zip
 
-Check new license works
+Check the registeration information:
 
-    pyarmor --version
+    pyarmor register
 
 **The registration code is valid forever, it can be used permanently.**
 

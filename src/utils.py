@@ -28,10 +28,13 @@ import logging
 import os
 import re
 import shutil
+import struct
 import sys
 import tempfile
 from codecs import BOM_UTF8
+from glob import glob
 from json import dumps as json_dumps, loads as json_loads
+from subprocess import Popen
 from time import gmtime, strftime
 from zipfile import ZipFile
 
@@ -42,43 +45,104 @@ except ImportError:
 
 import pytransform
 from config import dll_ext, dll_name, entry_lines, protect_code_template, \
-                   platform_urls, platform_config
+    platform_urls, platform_config, key_url, core_version, \
+    PYARMOR_HOME, PYARMOR_PATH
 
-PYARMOR_PATH = os.getenv('PYARMOR_PATH', os.path.dirname(__file__))
+DATA_PATH = os.path.join(PYARMOR_HOME, '.pyarmor')
+PLATFORM_PATH = os.path.join(PYARMOR_PATH, pytransform.plat_path)
+CROSS_PLATFORM_PATH = os.path.join(DATA_PATH, pytransform.plat_path)
+PLUGINS_PATH = os.path.join(DATA_PATH, 'plugins')
 
 
-def pytransform_bootstrap(path=None, capsule=None):
-    path = PYARMOR_PATH if path is None else path
+def _format_platid(platid=None):
+    if platid is None:
+        platid = pytransform.format_platform()
+    if os.path.isabs(platid):
+        return os.path.normpath(platid)
+    return platid.replace('\\', '/').replace('/', '.')
+
+
+def _search_downloaded_files(path, platid, libname):
+    libpath = os.path.join(path, platid)
+    if os.path.exists(libpath):
+        for x in os.listdir(libpath):
+            if os.path.exists(os.path.join(libpath, x, libname)):
+                return os.path.join(platid, x)
+
+
+def pytransform_bootstrap(capsule=None):
+    if pytransform._pytransform is not None:
+        return
+    logging.debug('PyArmor installation path: %s', PYARMOR_PATH)
+    logging.debug('PyArmor data path: %s', DATA_PATH)
+    path = PYARMOR_PATH
     licfile = os.path.join(path, 'license.lic')
     if not os.path.exists(licfile):
-        if not os.access(path, os.W_OK):
-            logging.error('Bootstrap need write file "license.lic" to %s, '
-                          'please run pyarmor with sudo for first time',
-                          path)
-            raise RuntimeError('No write permission for target path')
-        shutil.copy(os.path.join(PYARMOR_PATH, 'license.tri'), licfile)
+        if not os.getenv('PYARMOR_HOME',
+                         os.getenv('HOME', os.getenv('USERPROFILE'))):
+            logging.info('Create trial license file: %s', licfile)
+            shutil.copy(os.path.join(path, 'license.tri'), licfile)
+        else:
+            licfile = os.path.join(DATA_PATH, 'license.lic')
+            if not os.path.exists(licfile):
+                if not os.path.exists(DATA_PATH):
+                    logging.info('Create pyarmor data path: %s', DATA_PATH)
+                    os.makedirs(DATA_PATH)
+                logging.info('Create trial license file: %s', licfile)
+                shutil.copy(os.path.join(path, 'license.tri'), licfile)
 
     libname = dll_name + dll_ext
-    platname = None
-    if not os.path.exists(os.path.join(path, libname)):
-        libpath = os.path.join(path, 'platforms')
-        platname = os.getenv('PYARMOR_PLATFORM')
-        platid = pytransform.format_platname(platname)
-        if not os.path.exists(os.path.join(libpath, platid, libname)):
-            download_pytransform(platid)
-            logging.info('Bootstrap OK.\n')
-    pytransform.pyarmor_init(platname=platname)
+    platid = pytransform.format_platform()
+    logging.debug('Native platform is %s', _format_platid(platid))
 
-    if capsule is not None:
-        if not (os.path.exists(capsule) and check_capsule(capsule)):
-            logging.info('Generate global capsule %s', capsule)
-            make_capsule(capsule)
+    if os.getenv('PYARMOR_PLATFORM'):
+        p = os.getenv('PYARMOR_PLATFORM')
+        logging.info('PYARMOR_PLATFORM is set to %s', p)
+        platid = os.path.join(*os.path.normpath(p).split('.'))
+        logging.debug('Build platform is %s', _format_platid(platid))
+
+    if os.path.isabs(platid):
+        if not os.path.exists(os.path.join(platid, dll_name)):
+            raise RuntimeError('No dynamic library found at %s', platid)
+    else:
+        libpath = PLATFORM_PATH
+        logging.debug('Search dynamic library in the path: %s', libpath)
+        if not os.path.exists(os.path.join(libpath, platid, libname)):
+            libpath = CROSS_PLATFORM_PATH
+            logging.debug('Search dynamic library in the path: %s', libpath)
+            if not os.path.exists(os.path.join(libpath, platid, libname)):
+                found = _search_downloaded_files(libpath, platid, libname)
+                if found:
+                    logging.debug('Found available dynamic library %s', found)
+                    platid = found
+                else:
+                    if not os.path.exists(libpath):
+                        logging.info('Create cross platform libraries path %s',
+                                     libpath)
+                        os.makedirs(libpath)
+                    rid = download_pytransform(platid, libpath, index=0)[0]
+                    platid = os.path.join(*rid.split('.'))
+        if libpath == CROSS_PLATFORM_PATH:
+            platid = os.path.abspath(os.path.join(libpath, platid))
+
+    pytransform.pyarmor_init(platid=platid)
+    logging.debug('Loaded dynamic library: %s', pytransform._pytransform._name)
+
+    ver = pytransform.version_info()
+    logging.debug('The version of core library is %s', ver)
+    if ver[0] < 14:
+        raise RuntimeError('PyArmor does not work with this core library '
+                           '(r%d), which reversion < 14' % ver[0])
+
+    if capsule is not None and not os.path.exists(capsule):
+        logging.info('Generating public capsule ...')
+        make_capsule(capsule)
 
 
 def _get_remote_file(urls, path, timeout=3.0):
     while urls:
         prefix = urls[0]
-        url = '/'.join([prefix, 'platforms', path])
+        url = '/'.join([prefix, path])
         logging.info('Getting remote file: %s', url)
         try:
             return urlopen(url, timeout=timeout)
@@ -88,91 +152,139 @@ def _get_remote_file(urls, path, timeout=3.0):
 
 
 def _get_platform_list(urls, platid=None):
-    f = _get_remote_file(urls, platform_config)
-    if f is None:
-        raise RuntimeError('No available site to download library file')
+    cfg = None
+    if not os.path.exists(CROSS_PLATFORM_PATH):
+        logging.info('Create cross platforms path: %s', CROSS_PLATFORM_PATH)
+        os.makedirs(CROSS_PLATFORM_PATH)
+    filename = os.path.join(PLATFORM_PATH, platform_config)
+    if os.path.exists(filename):
+        with open(filename) as f:
+            cfg = json_loads(f.read())
+        if cfg.get('version') == core_version:
+            logging.info('Load platforms information from %s', filename)
+        else:
+            cfg = None
+    if cfg is None:
+        f = _get_remote_file(urls, platform_config)
+        if f is None:
+            raise RuntimeError('Download platform list file failed')
+
+        logging.info('Load platform informations from remote file')
+        data = f.read().decode()
+        cfg = json_loads(data)
+
+        if cfg.get('version') == core_version:
+            logging.info('Cache platform informations to %s', filename)
+            with open(filename, 'w') as f:
+                f.write(data)
+        else:
+            logging.warning('The core library excepted version is %s, '
+                            'but got %s from remote server',
+                            core_version, cfg.get('version'))
 
     if platid is not None:
-        platid = platid.replace('\\', '/')
-        if platid.find('/') == -1:
-            name, mach = platid, pytransform.platform.machine().lower()
-        else:
-            name, mach = platid.split('/', 1)
-        logging.info('Search library for %s and arch %s', name, mach)
+        logging.info('Search library for platform: %s', platid)
 
-    logging.info('Loading platforms information')
-    cfg = json_loads(f.read().decode())
     return cfg.get('platforms', []) if platid is None \
         else [x for x in cfg.get('platforms', [])
-              if platid == x['path'] or (
-                      name == x['platname'] and mach in x['machines'])]
+              if (platid is None
+                  or (x['id'] == platid)
+                  or (x['id'].find(platid + '.') == 0)
+                  or (x['path'] == platid))]
 
 
 def get_platform_list():
     return _get_platform_list(platform_urls[:])
 
 
-def download_pytransform(platid, saveas=None, url=None):
+def download_pytransform(platid, output=None, url=None, index=None):
+    platid = _format_platid(platid)
     urls = platform_urls[:] if url is None else ([url] + platform_urls)
     plist = _get_platform_list(urls, platid)
     if not plist:
         logging.error('Unsupport platform %s', platid)
         raise RuntimeError('No available library for this platform')
 
-    p = plist[0]
-    libname = p['filename']
-    path = '/'.join([p['path'], libname])
-    logging.info('Found available library %s', path)
+    if index is not None:
+        plist = plist[index:index + 1]
 
-    if not os.access(PYARMOR_PATH, os.W_OK):
-        logging.error('Cound not download library file to %s', PYARMOR_PATH)
+    result = [p['id'] for p in plist]
+    logging.info('Found available libraries: %s', result)
+
+    if output is None:
+        output = CROSS_PLATFORM_PATH
+    if not os.access(output, os.W_OK):
+        logging.error('Cound not download library file to %s', output)
         raise RuntimeError('No write permission for target path')
 
-    logging.info('Downloading library file ...')
-    res = _get_remote_file(urls, path, timeout=60)
+    for p in plist:
+        libname = p['filename']
+        path = '/'.join([p['path'], libname])
 
-    dest = os.path.join(PYARMOR_PATH, 'platforms',
-                        platid if saveas is None else saveas)
-    if not os.path.exists(dest):
-        logging.info('Create target path: %s', dest)
-        os.makedirs(dest)
+        logging.info('Downloading library file for %s ...', p['id'])
+        res = _get_remote_file(urls, path, timeout=60)
 
-    data = res.read()
-    if hashlib.sha256(data).hexdigest() != p['sha256']:
-        raise RuntimeError('Verify downloaded library failed')
+        if res is None:
+            raise RuntimeError('Download library file failed')
 
-    target = os.path.join(dest, libname)
-    logging.info('Writing target file: %s', target)
-    with open(target, 'wb') as f:
-        f.write(data)
-    logging.info('Download pytransform library file successfully.')
+        dest = os.path.join(output, *p['id'].split('.'))
+        if not os.path.exists(dest):
+            logging.info('Create target path: %s', dest)
+            os.makedirs(dest)
+
+        data = res.read()
+        if hashlib.sha256(data).hexdigest() != p['sha256']:
+            raise RuntimeError('Verify dynamic library failed')
+
+        target = os.path.join(dest, libname)
+        logging.info('Writing target file: %s', target)
+        with open(target, 'wb') as f:
+            f.write(data)
+
+        logging.info('Download dynamic library %s OK', p['id'])
+
+    return result
+
+
+def update_pytransform(pattern):
+    platforms = dict([(p['id'], p) for p in get_platform_list()])
+    path = os.path.join(CROSS_PLATFORM_PATH, '*', '*', '*', '_pytransform.*')
+    flist = glob(path)
+
+    plist = []
+    n = len(CROSS_PLATFORM_PATH) + 1
+    for filename in flist:
+        platid = _format_platid(os.path.dirname(filename)[n:])
+        if not ((pattern == '*') or platid.startswith(pattern)):
+            continue
+        p = platforms.get(platid)
+        if p is None:
+            logging.warning('No %s found in supported platforms', platid)
+        else:
+            with open(filename, 'rb') as f:
+                data = f.read()
+            if hashlib.sha256(data).hexdigest() == p['sha256']:
+                logging.info('The platform %s has been latest', platid)
+            else:
+                plist.append(p['id'])
+
+    if plist:
+        for platid in plist:
+            download_pytransform(platid)
+    else:
+        logging.info('Nothing updated')
 
 
 def make_capsule(filename):
-    path = PYARMOR_PATH
-    for a in 'public.key', 'license.lic':
-        x = os.path.join(path, a)
-        if not os.path.exists(x):
-            raise RuntimeError('No %s found in pyarmor' % x)
-    licfile = os.path.join(path, 'license.lic')
-
-    logging.info('Generating project key ...')
-    pri, pubx, capkey, newkey, lic = pytransform.generate_capsule(licfile)
-    logging.info('Generate project key OK.')
-
-    logging.info('Writing capsule to %s ...', filename)
-    myzip = ZipFile(filename, 'w')
-    try:
-        myzip.write(os.path.join(path, 'public.key'), 'pyshield.key')
-        myzip.writestr('pyshield.lic', capkey)
-        # myzip.write(os.path.join(path, 'pytransform.py'), 'pytransform.py')
-        myzip.writestr('private.key', pri)
-        myzip.writestr('product.key', pubx)
-        myzip.writestr('pytransform.key', newkey)
-        myzip.writestr('license.lic', lic)
-    finally:
-        myzip.close()
-    logging.info('Write capsule OK.')
+    if get_registration_code():
+        logging.error('The registered version would use private capsule.'
+                      '\n\t Please run `pyarmor register KEYFILE` '
+                      'to restore your private capsule.')
+        raise RuntimeError('Could not generate private capsule.')
+    public_capsule = os.path.join(PYARMOR_PATH, 'public_capsule.zip')
+    logging.debug('Copy %s to %s', public_capsule, filename)
+    shutil.copy(public_capsule, filename)
+    logging.debug('Generate public capsule %s OK.', filename)
 
 
 def check_capsule(capsule):
@@ -187,9 +299,11 @@ def check_capsule(capsule):
     return True
 
 
-def _make_entry(filename, rpath=None, runtime=True, shell=None):
-    ispkg = os.path.basename(filename) == '__init__.py'
-    entry_code = entry_lines[0] % ('.' if runtime and ispkg else '')
+def _make_entry(filename, rpath=None, relative=None, shell=None, suffix=''):
+    pkg = os.path.basename(filename) == '__init__.py'
+    entry_code = entry_lines[0] % (
+        '.' if (relative is True) or ((relative is None) and pkg) else '',
+        suffix)
 
     with open(filename, 'r') as f:
         lines = f.readlines()
@@ -209,7 +323,12 @@ def _make_entry(filename, rpath=None, runtime=True, shell=None):
         if shell:
             f.write(shell)
         f.write(entry_code)
-        f.write(entry_lines[1] % ('' if rpath is None else repr(rpath)))
+        paras = []
+        if rpath is not None:
+            paras.append(repr(rpath))
+        if suffix:
+            paras.append('suffix=%s' % repr(suffix))
+        f.write(entry_lines[1] % ', '.join(paras))
         f.write(''.join(lines[n:]))
 
 
@@ -225,9 +344,7 @@ def _get_script_shell(script):
             pass
 
 
-def make_entry(entris, path, output, rpath=None, runtime=True, ispackage=False):
-    if ispackage:
-        output = os.path.join(output, os.path.basename(path))
+def make_entry(entris, path, output, rpath=None, relative=None, suffix=''):
     for entry in entris.split(','):
         entry = entry.strip()
         filename = build_path(entry, output)
@@ -236,12 +353,14 @@ def make_entry(entris, path, output, rpath=None, runtime=True, ispackage=False):
             shell = _get_script_shell(src)
         else:
             shell = None
-            logging.info('Copy entry script %s to %s', src, filename)
+            logging.info('Copy entry script %s to %s', src, relpath(filename))
             shutil.copy(src, filename)
         if shell:
-            logging.info('Insert shell line: %s', shell)
-        logging.info('Insert bootstrap code to entry script %s', filename)
-        _make_entry(filename, rpath, runtime=runtime, shell=shell)
+            logging.info('Insert shell line: %s', shell.strip())
+        logging.info('Insert bootstrap code to entry script %s',
+                     relpath(filename))
+        _make_entry(filename, rpath, relative=relative, shell=shell,
+                    suffix=suffix)
 
 
 def obfuscate_scripts(filepairs, mode, capsule, output):
@@ -267,16 +386,67 @@ def obfuscate_scripts(filepairs, mode, capsule, output):
     return filepairs
 
 
-def _get_platform_library(platname):
-    path = os.path.join(PYARMOR_PATH, 'platforms', platname)
-    for x in os.listdir(path):
-        if x.startswith('_pytransform.'):
-            return os.path.join(path, x)
-    raise RuntimeError('No dynamic library found for %s' % platname)
+def _get_platform_library_filename(platid):
+    if os.path.isabs(platid):
+        plist = [platid]
+    else:
+        n = pytransform.version_info()[2]
+        t = list(platid.split('.'))
+        plist = [os.path.join(PLATFORM_PATH, *t)] if n & 2 else []
+        if len(t) == 2:
+            t.append(n)
+            for k in ([3, 7] if n & 2 else [0, 4, 5]):
+                t[-1] = str(k)
+                plist.append(os.path.join(CROSS_PLATFORM_PATH, *t))
+        else:
+            plist.append(os.path.join(CROSS_PLATFORM_PATH, *t))
+
+    for path in plist:
+        if not os.path.exists(path):
+            continue
+        for x in os.listdir(path):
+            if x.startswith('_pytransform.'):
+                return os.path.join(path, x)
 
 
-def make_runtime(capsule, output, licfile=None, platform=None):
-    logging.info('Generating runtime files to %s', output)
+def _build_platforms(platforms):
+    results = []
+    checksums = dict([(p['id'], p['sha256']) for p in get_platform_list()])
+    n = len(platforms)
+    for platid in platforms:
+        if (n > 1) and os.path.isabs(platid):
+            raise RuntimeError('Invalid platform `%s`, for multiple platforms '
+                               'it must be `platform.machine`' % platid)
+        if (n > 1) and platid.startswith('vs2015.'):
+            raise RuntimeError('The platform `%s` does not work '
+                               'in multiple platforms target' % platid)
+        filename = _get_platform_library_filename(platid)
+        if filename is None:
+            logging.info('No dynamic library found for %s' % platid)
+            download_pytransform(platid)
+            filename = _get_platform_library_filename(platid)
+            if filename is None:
+                raise RuntimeError('No dynamic library found for %s' % platid)
+
+        if platid in checksums:
+            with open(filename, 'rb') as f:
+                data = f.read()
+            if hashlib.sha256(data).hexdigest() != checksums[platid]:
+                logging.info('The platform %s is out of date', platid)
+                download_pytransform(platid)
+        results.append(filename)
+
+    logging.debug('Target dynamic library: %s', results)
+    return results
+
+
+def make_runtime(capsule, output, licfile=None, platforms=None, package=False,
+                 suffix=''):
+    if package:
+        output = os.path.join(output, 'pytransform' + suffix)
+        if not os.path.exists(output):
+            os.makedirs(output)
+    logging.info('Generating runtime files to %s', relpath(output))
 
     myzip = ZipFile(capsule, 'r')
     if 'pytransform.key' in myzip.namelist():
@@ -292,27 +462,52 @@ def make_runtime(capsule, output, licfile=None, platform=None):
         logging.info('Extract license.lic')
         myzip.extract('license.lic', output)
     else:
-        logging.info('Copying %s', licfile)
+        logging.info('Copying %s as license file', relpath(licfile))
         shutil.copy2(licfile, os.path.join(output, 'license.lic'))
 
-    if platform is None:
+    def copy3(src, dst):
+        if suffix:
+            x = os.path.basename(src).replace('.', ''.join([suffix, '.']))
+            shutil.copy2(src, os.path.join(dst, x))
+        else:
+            shutil.copy2(src, dst)
+
+    if not platforms:
         libfile = pytransform._pytransform._name
         if not os.path.exists(libfile):
             libname = dll_name + dll_ext
             libfile = os.path.join(PYARMOR_PATH, libname)
             if not os.path.exists(libfile):
-                pname = pytransform.format_platname()
+                pname = pytransform.format_platform()
                 libpath = os.path.join(PYARMOR_PATH, 'platforms')
                 libfile = os.path.join(libpath, pname, libname)
         logging.info('Copying %s', libfile)
-        shutil.copy2(libfile, output)
-    else:
-        filename = _get_platform_library(platform)
+        copy3(libfile, output)
+    elif len(platforms) == 1:
+        filename = _build_platforms(platforms)[0]
         logging.info('Copying %s', filename)
-        shutil.copy2(filename, output)
+        copy3(filename, output)
+    else:
+        libpath = os.path.join(output, pytransform.plat_path)
+        logging.info('Create library path to support multiple platforms: %s',
+                     libpath)
+        if not os.path.exists(libpath):
+            os.mkdir(libpath)
+
+        filenames = _build_platforms(platforms)
+        for platid, filename in list(zip(platforms, filenames)):
+            logging.info('Copying %s', filename)
+            path = os.path.join(libpath, *platid.split('.')[:2])
+            logging.info('To %s', path)
+            if not os.path.exists(path):
+                os.makedirs(path)
+            copy3(filename, path)
 
     filename = os.path.join(PYARMOR_PATH, 'pytransform.py')
-    shutil.copy2(filename, output)
+    if package:
+        shutil.copy2(filename, os.path.join(output, '__init__.py'))
+    else:
+        copy3(filename, output)
 
     logging.info('Generate runtime files OK')
 
@@ -327,12 +522,27 @@ def make_project_license(capsule, code, output):
         os.remove(prikey)
 
 
+def make_license_key(capsule, code, output=None, key=None):
+    prikey = ZipFile(capsule, 'r').read('private.key') \
+        if key is None else key
+    size = len(prikey)
+    lickey = pytransform.generate_license_key(prikey, size, code)
+    if output is None:
+        return lickey
+    elif output in ('stdout', 'stderr'):
+        getattr(sys, output).write(
+            lickey.decode() if hasattr(lickey, 'decode') else lickey)
+    else:
+        with open(output, 'wb') as f:
+            f.write(lickey)
+
+
 def show_hd_info():
     pytransform.show_hd_info()
 
 
-def build_path(path, relpath):
-    return path if os.path.isabs(path) else os.path.join(relpath, path)
+def build_path(path, start):
+    return path if os.path.isabs(path) else os.path.join(start, path)
 
 
 def make_project_command(platform, python, pyarmor, output):
@@ -357,40 +567,121 @@ def get_registration_code():
     return code
 
 
-def patch_plugins(plugins):
+def search_plugins(plugins):
+    if plugins:
+        result = []
+        path = os.getenv('PYARMOR_PLUGIN', PLUGINS_PATH)
+        for name in plugins:
+            i = 1 if name[0] == '@' else 0
+            filename = name[i:] + ('' if name.endswith('.py') else '.py')
+            key = os.path.basename(name[i:])
+            if not os.path.exists(filename):
+                filename = build_path(filename, path)
+                if not os.path.exists(filename):
+                    raise RuntimeError('No script found for plugin %s' % name)
+            logging.info('Found plugin %s at: %s', key, filename)
+            result.append((key, filename, not i))
+        return result
+
+
+def _patch_plugins(plugins, pnames):
     result = []
-    path = os.getenv('PYARMOR_PLUGIN', '')
-    for name in plugins:
-        filename = name if name.endswith('.py') else (name + '.py')
-        filename = build_path(filename, path)
-        if not os.path.exists(filename):
-            raise RuntimeError('No plugin script %s found' % filename)
-        with open(filename, 'r') as f:
-            result.append(f.read())
+    for key, filename, x in plugins:
+        if x or (key in pnames):
+            logging.info('Apply plugin %s', key)
+            lines = _readlines(filename)
+            result.append(''.join(lines))
+    if pnames and not result:
+        raise RuntimeError('There are plugin calls, but no plugin definition')
+    return ['\n'.join(result)]
+
+
+def _filter_call_marker(plugins, marker, name):
+    if marker.startswith('# PyArmor'):
+        return True
+    for key, filename, x in plugins:
+        if name == key:
+            return True
+
+
+def _build_source_keylist(source, code, closure):
+    result = []
+    flist = ('dllmethod', 'init_pytransform', 'init_runtime', '_load_library',
+             'get_registration_code', 'get_expired_days', 'get_hd_info',
+             'get_license_info', 'get_license_code', 'format_platform',
+             'pyarmor_init', 'pyarmor_runtime')
+
+    def _make_value(co):
+        return len(co.co_names), len(co.co_consts), len(co.co_code)
+
+    def _make_code_key(co):
+        v1 = _make_value(co)
+        v2 = _make_value(co.co_consts[1]) if co.co_name == 'dllmethod'else None
+        co_closure = getattr(co, closure, None)
+        v3 = _make_value(getattr(co_closure[0].cell_contents, code)) \
+            if co_closure else None
+        return v1, v2, v3
+
+    mod_co = compile(source, 'pytransform', 'exec')
+    result.append((-1, _make_code_key(mod_co)))
+    mod_consts = mod_co.co_consts
+    for i in range(len(mod_consts)):
+        co_const = mod_consts[i]
+        co = getattr(co_const, code, None)
+        if co and co.co_name in flist:
+            result.append((i, _make_code_key(co)))
     return result
 
 
-def make_protect_pytransform(template=None, filename=None, rpath=None):
-    if filename is None:
-        filename = pytransform._pytransform._name
-    if template is None:
-        template = os.path.join(PYARMOR_PATH, protect_code_template)
-    size = os.path.getsize(filename) & 0xFFFFFFF0
-    n = size >> 2
-    with open(filename, 'rb') as f:
-        buf = f.read(size)
-    fmt = 'I' * n
-    cosum = sum(pytransform.struct.unpack(fmt, buf)) & 0xFFFFFFFF
+def _build_pytransform_keylist(mod, code, closure):
+    result = []
+    flist = ('dllmethod', 'init_pytransform', 'init_runtime', '_load_library',
+             'get_registration_code', 'get_expired_days', 'get_hd_info',
+             'get_license_info', 'get_license_code', 'format_platform',
+             'pyarmor_init', 'pyarmor_runtime', '_match_features')
+
+    def _make_value(co):
+        return len(co.co_names), len(co.co_consts), len(co.co_code)
+
+    def _make_code_key(co):
+        v1 = _make_value(co)
+        v2 = _make_value(co.co_consts[1]) if co.co_name == 'dllmethod'else None
+        co_closure = getattr(co, closure, None)
+        v3 = _make_value(getattr(co_closure[0].cell_contents, code)) \
+            if co_closure else None
+        return v1, v2, v3
+
+    for name in flist:
+        co = getattr(getattr(mod, name), code)
+        result.append((name, _make_code_key(co)))
+    return result
+
+
+def _make_protect_pytransform(template, filenames=None, rpath=None, suffix=''):
+    if filenames is None:
+        filenames = [pytransform._pytransform._name]
+    checksums = []
+    for name in filenames:
+        size = os.path.getsize(name) & 0xFFFFFFF0
+        n = size >> 2
+        with open(name, 'rb') as f:
+            buf = f.read(size)
+        fmt = 'I' * n
+        cosum = sum(struct.unpack(fmt, buf)) & 0xFFFFFFFF
+        checksums.append(cosum)
 
     with open(template) as f:
         buf = f.read()
 
     code = '__code__' if sys.version_info[0] == 3 else 'func_code'
     closure = '__closure__' if sys.version_info[0] == 3 else 'func_closure'
-    rpath = 'pytransform.os.path.dirname(__file__)' if rpath is None \
-            else repr(rpath)
-    return buf.format(code=code, closure=closure, size=size, checksum=cosum,
-                      rpath=rpath, filename=repr(os.path.basename(filename)))
+    keylist = _build_pytransform_keylist(pytransform, code, closure)
+    rpath = '{0}.os.path.dirname({0}.__file__)'.format(
+        'pytransform') if rpath is None else repr(rpath)
+    spath = '{0}.os.path.join({0}.plat_path, {0}.format_platform())'.format(
+        'pytransform') if len(filenames) > 1 else repr('')
+    return buf.format(code=code, closure=closure, rpath=rpath, spath=spath,
+                      checksum=str(checksums), keylist=keylist, suffix=suffix)
 
 
 def _frozen_modname(filename, filename2):
@@ -428,43 +719,61 @@ def _guess_encoding(filename):
             return m and m.group(1)
 
 
-def encrypt_script(pubkey, filename, destname, wrap_mode=1, obf_code=1,
-                   obf_mod=1, adv_mode=0, rest_mode=1, protection=0,
-                   plugins=None, rpath=None):
+def _readlines(filename):
     if sys.version_info[0] == 2:
         with open(filename, 'r') as f:
             lines = f.readlines()
     else:
         encoding = _guess_encoding(filename)
-        with open(filename, 'r', encoding=encoding) as f:
-            lines = f.readlines()
+        try:
+            with open(filename, 'r', encoding=encoding) as f:
+                lines = f.readlines()
+        except UnicodeDecodeError:
+            encoding = 'utf-8'
+            with open(filename, 'r', encoding=encoding) as f:
+                lines = f.readlines()
+        # Try to remove any UTF BOM bytes
         if encoding == 'utf-8' and lines:
-            i = lines[0].find('#')
-            if i > 0:
+            i = 0
+            for c in lines[0]:
+                if ord(c) < 128:
+                    break
+                i += 1
+            if i:
                 lines[0] = lines[0][i:]
+    return lines
 
+
+def encrypt_script(pubkey, filename, destname, wrap_mode=1, obf_code=1,
+                   obf_mod=1, adv_mode=0, rest_mode=1, protection=0,
+                   platforms=None, plugins=None, rpath=None, suffix=''):
+    lines = _readlines(filename)
     if plugins:
         n = 0
         k = -1
         plist = []
-        marker = '# PyArmor Plugin:'
+        pnames = []
+        markers = '# PyArmor Plugin: ', '# pyarmor_', '# @pyarmor_'
         for line in lines:
             if line.startswith('# {PyArmor Plugins}'):
                 k = n + 1
-            elif (line.startswith("if __name__ == '__main__':")
-                  or line.startswith('if __name__ == "__main__":')):
-                if k == -1:
-                    k = n
             else:
-                i = line.find(marker)
-                if i > -1:
-                    plist.append((n+1, i))
+                for marker in markers:
+                    i = line.find(marker)
+                    if i > -1:
+                        name = line[i+len(marker):].strip().strip('@')
+                        t = name.find('(')
+                        name = (name if t == -1 else name[:t]).strip()
+                        if _filter_call_marker(plugins, marker, name):
+                            plist.append((n+1, i, marker))
+                            pnames.append(name)
             n += 1
         if k > -1:
-            logging.info('Patch this entry script with plugins')
-            lines[k:k] = patch_plugins(plugins)
-        for n, i in plist:
-            lines[n] = lines[n][:i] + lines[n][i+len(marker):].lstrip()
+            logging.info('Patch this script with plugins')
+            lines[k:k] = _patch_plugins(plugins, pnames)
+        for n, i, m in plist:
+            c = '@' if m[2] == '@' else ''
+            lines[n] = lines[n][:i] + c + lines[n][i+len(m):]
 
     if protection:
         n = 0
@@ -476,47 +785,37 @@ def encrypt_script(pubkey, filename, destname, wrap_mode=1, obf_code=1,
                   or line.startswith("if __name__ == '__main__':")
                   or line.startswith('if __name__ == "__main__":')):
                 logging.info('Patch this entry script with protection code')
-                template, target = None, None
-                if not isinstance(protection, int):
-                    if protection.find(',') == -1:
-                        target = _get_platform_library(protection)
-                    else:
-                        template, platname = protection.split(',')
-                        target = _get_platform_library(platname)
-                if template:
-                    logging.info('Use template: %s', template)
-                if target:
-                    logging.info('Target dynamic library: %s', target)
-                lines[n:n] = [make_protect_pytransform(template=template,
-                                                       filename=target,
-                                                       rpath=rpath)]
+                template = os.path.join(PYARMOR_PATH, protect_code_template) \
+                    if isinstance(protection, int) else protection
+                logging.info('Use template: %s', template)
+                targets = _build_platforms(platforms) if platforms else None
+                lines[n:n] = [_make_protect_pytransform(template=template,
+                                                        filenames=targets,
+                                                        rpath=rpath,
+                                                        suffix=suffix)]
                 break
             n += 1
 
     if sys.flags.debug and (protection or plugins):
-        with open(filename + '.pyarmor-patched', 'w') as f:
+        patched_script = filename + '.pyarmor-patched'
+        logging.info('Write patched script for debugging: %s', patched_script)
+        with open(patched_script, 'w') as f:
             f.write(''.join(lines))
 
     modname = _frozen_modname(filename, destname)
     co = compile(''.join(lines), modname, 'exec')
 
     flags = obf_code | obf_mod << 8 | wrap_mode << 16 | adv_mode << 24 \
-        | (9 if rest_mode == 4 else 5 if rest_mode == 2 else rest_mode) << 28
-    s = pytransform.encrypt_code_object(pubkey, co, flags)
+        | (11 if rest_mode == 4 else 15 if rest_mode == 3 else
+           7 if rest_mode == 2 else rest_mode) << 28
+    s = pytransform.encrypt_code_object(pubkey, co, flags, suffix=suffix)
 
     with open(destname, 'w') as f:
         f.write(s.decode())
 
 
 def get_product_key(capsule):
-    output = tempfile.gettempdir()
-    keyfile = os.path.join(output, 'product.key')
-    ZipFile(capsule).extract('product.key', path=output)
-    try:
-        with open(keyfile, 'rb') as f:
-            return f.read()
-    finally:
-        os.remove(keyfile)
+    return ZipFile(capsule).read('product.key')
 
 
 def upgrade_capsule(capsule):
@@ -556,6 +855,138 @@ def save_config(cfg, filename=None):
     s = json_dumps(cfg, indent=2)
     with open(filename, 'w') as f:
         f.write(s)
+
+
+def query_keyinfo(key):
+    try:
+        res = urlopen(key_url % key, timeout=3.0)
+        customer = json_loads(res.read().decode())
+    except Exception as e:
+        if sys.flags.debug:
+            logging.warning(e)
+        return 'Because of internet exception, could not query ' \
+               'registration information.'
+
+    name = customer['name']
+    email = customer['email']
+    if name and email:
+        info = 'This code is authorized to %s <%s>' % (name, email)
+    else:
+        info = 'Warning: this code may NOT be issued by PyArmor officially.' \
+            '\nPlease contact the author Jondy Zhao <jondy.zhao@gmail.com>'
+    return info
+
+
+def register_keyfile(filename, legency=False):
+    if (not legency) and \
+       not os.getenv('PYARMOR_HOME',
+                     os.getenv('HOME', os.getenv('USERPROFILE'))):
+        logging.debug('Force traditional way because no HOME set')
+        legency = True
+    old_path = DATA_PATH if legency else PYARMOR_PATH
+    old_license = os.path.join(old_path, 'license.lic')
+    if os.path.exists(old_license):
+        logging.info('Remove old license file `%s`', old_license)
+        os.remove(old_license)
+
+    home = PYARMOR_HOME
+    path = PYARMOR_PATH if legency else DATA_PATH
+    if not os.path.exists(path):
+        logging.info('Create path: %s', path)
+        os.makedirs(path)
+
+    f = ZipFile(filename, 'r')
+    try:
+        for item in [('license key', 'license.lic', path),
+                     ('private capsule', '.pyarmor_capsule.zip', home)]:
+            logging.info('Extract %s "%s" to %s' % item)
+            f.extract(item[1], path=item[-1])
+    finally:
+        f.close()
+
+
+def relpath(path, start=os.curdir):
+    try:
+        r = os.path.relpath(path, start)
+        return path if r.count('..') > 1 else r
+    except Exception:
+        return path
+
+
+def check_cross_platform(platforms):
+    if os.getenv('PYARMOR_PLATFORM'):
+        return False
+    for name in platforms:
+        if name.endswith('.0') or \
+           name in ('linux.arm', 'android.aarch64', 'linux.ppc64',
+                    'darwin.arm64', 'freebsd.x86_64', 'alpine.x86_64',
+                    'alpine.arm', 'poky.x86', 'vs2015.x86_64', 'vs2015.x86'):
+            logging.info('===========================================')
+            logging.info('Reboot PyArmor to obfuscate the scripts for '
+                         'platform %s', name)
+            logging.info('===========================================')
+            os.putenv('PYARMOR_PLATFORM', '.'.join([_format_platid(), '0']))
+            p = Popen([sys.executable] + sys.argv)
+            p.wait()
+            return p.returncode
+    return False
+
+
+def compatible_platform_names(platforms):
+    '''Only for compatibility, it will be removed in next major version.'''
+    if not platforms:
+        return platforms
+
+    old_forms = {
+        'armv5': 'linux.arm',
+        'ppc64le': 'linux.ppc64',
+        'ios.arm64': 'darwin.arm64',
+        'freebsd': 'freebsd.x86_64',
+        'alpine': 'alpine.x86_64',
+        'poky-i586': 'poky.x86',
+    }
+
+    result = []
+    for names in platforms:
+        for name in names.split(','):
+            name = name.strip()
+            if name in old_forms:
+                logging.warning(
+                    'This platform name `%s` has been deprecated, '
+                    'use `%s` instead. Display all standard platform '
+                    'names by `pyarmor download --help-platorm`',
+                    name, old_forms[name])
+                result.append(old_forms[name])
+            else:
+                result.append(name)
+    return result
+
+
+def make_bootstrap_script(output, capsule=None, relative=None, suffix=''):
+    filename = os.path.basename(output)
+    co = compile('', filename, 'exec')
+    flags = 0x18000000
+    prokey = get_product_key(capsule)
+    buf = pytransform.encrypt_code_object(prokey, co, flags, suffix=suffix)
+    with open(output, 'w') as f:
+        f.write(buf.decode())
+    _make_entry(output, relative=relative, suffix=suffix)
+
+
+def get_name_suffix():
+    rcode = get_registration_code()
+    if rcode is None:
+        return ''
+
+    m, n = rcode.replace('-sn-1.txt', '').split('-')[-2:]
+    d = {
+        'vax': 'vax',
+        'clickbank': 'vac',
+        'shareit': 'vas',
+        'regnow': 'var',
+        'Pyarmor': 'vad',
+    }
+    return '_'.join(['', d.get(m, 'unk'), n])
 
 
 if __name__ == '__main__':

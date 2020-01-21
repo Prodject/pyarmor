@@ -76,9 +76,11 @@ case ${PLATFORM} in
         ;;
     macosx_x86_64)
         PYTHON=${PYTHON:-python}
-        declare -r harddisk_sn=VB85de09d4-23402b07
-        declare -r ifmac_address=08:00:27:b0:b3:94
-        declare -r ifip_address=10.0.2.15
+        # declare -r harddisk_sn=VB85de09d4-23402b07
+        # declare -r ifmac_address=08:00:27:b0:b3:94
+        declare -r harddisk_sn=FV994730S6LLF07AY
+        declare -r ifmac_address=f8:ff:c2:27:00:7f
+        declare -r ifip_address=$(ipconfig getifaddr en0)
         declare -r domain_name=
         ;;
     *)
@@ -378,4 +380,16 @@ check_python_version_for_auto_wrap_mode()
     $PYTHON --version 2>&1 \
         | grep -q "\(Python 3.0\|Python 3.1\|Python 3.2\)" \
         && csih_inform "The auto wrap mode doesn't work for $PYTHON"
+}
+
+# ======================================================================
+# Routine: patch_cross_protection_code_for_python3.0
+#
+#   Remove "assert_buildin(open)" from cross protection code if python
+#   version is 3.0, because it return OpenWrapper in Python3.0
+# ======================================================================
+patch_cross_protection_code_for_python3.0()
+{
+    $PYTHON --version 2>&1 | grep -q "Python 3.0" \
+        && $SED -i -e "/assert_builtin.open./d" protect_code.pt
 }

@@ -21,19 +21,19 @@
 #
 #  @Description:
 #
-#   Pack obfuscated Python scripts with any of third party
-#   tools: py2exe, py2app, cx_Freeze
+#   Pack obfuscated Python scripts with PyInstaller
+#
+#   The prefer way is
+#
+#       pip install pyinstaller
+#       cd /path/to/src
+#       parmor pack hello.py
 #
 
-'''Pack obfuscated scripts to one bundle, distribute the
-bundle as a folder or file to other people, and they can
-execute your program without Python installed.
-
-The prefer way is
-
-    pip install pyinstaller
-    cd /path/to/src
-    parmor pack hello.py
+'''
+Pack obfuscated scripts to one bundle, distribute the bundle as a
+folder or file to other people, and they can execute your program
+without Python installed.
 
 '''
 
@@ -45,16 +45,12 @@ import sys
 
 from distutils.util import get_platform
 from glob import glob
+from json import load as json_load
 from py_compile import compile as compile_file
 from shlex import split
 from zipfile import PyZipFile
 
-
-try:
-    import argparse
-except ImportError:
-    # argparse is new in version 2.7
-    import polyfills.argparse as argparse
+import polyfills.argparse as argparse
 
 # Default output path, library name, command options for setup script
 DEFAULT_PACKER = {
@@ -89,12 +85,13 @@ def run_command(cmdlist):
     if p.returncode != 0:
         if not sys.flags.debug:
             logging.error('\n\n%s\n\n', output.decode())
-        raise RuntimeError('Run command failed')
+        raise RuntimeError(output.decode())
 
 
 def relpath(path, start=os.curdir):
     try:
-        return os.path.relpath(path, start)
+        r = os.path.relpath(path, start)
+        return path if r.count('..') > 2 else r
     except Exception:
         return path
 
@@ -200,8 +197,8 @@ def _packer(t, src, entry, build, script, output, options, xoptions, clean):
     filters = ('global-include *.py', 'prune build, prune dist',
                'prune %s' % project,
                'exclude %s pytransform.py' % entry)
-    args = ('config', '--runtime-path', '',
-            '--manifest', ','.join(filters), project)
+    args = ('config', '--runtime-path', '', '--package-runtime', '0',
+            '--restrict-mode', '0', '--manifest', ','.join(filters), project)
     call_pyarmor(args)
 
     logging.info('Run PyArmor to build the project')
@@ -230,39 +227,57 @@ def check_setup_script(_type, setup):
     raise RuntimeError('No setup script %s found' % setup)
 
 
-def run_pyi_makespec(project, obfdist, src, entry, packcmd, nolicense):
-    s = os.pathsep
-    # d = os.path.relpath(obfdist, project)
-    d = obfdist
-    datas = [
-        '--add-data', '%s%s.' % (os.path.join(d, 'pytransform.key'), s),
-        '--add-binary', '%s%s.' % (os.path.join(d, '_pytransform.*'), s)
-    ]
-    if not nolicense:
-        datas.append('--add-data')
-        datas.append('%s%s.' % (os.path.join(d, 'license.lic'), s))
+def _make_hook_pytransform(hookfile, obfdist, nolicense=False):
+    # On Mac OS X pyinstaller will call mac_set_relative_dylib_deps to
+    # modify .dylib file, it results in the cross protection of pyarmor fails.
+    # In order to fix this problem, we need add .dylib as data file
+    is_darwin = sys.platform == 'darwin'
+    p = obfdist + os.sep
+    d = 'datas = [(r"{0}pytransform.key", ".")' + (
+        ', (r"{0}_pytransform.*", ".")' if is_darwin else '') + (
+        ']' if nolicense else ', (r"{0}license.lic", ".")]')
+    b = '' if is_darwin else 'binaries = [(r"{0}_pytransform.*", ".")]'
+    with open(hookfile, 'w') as f:
+        f.write('\n'.join([d, b]).format(p))
 
-    scripts = [os.path.join(src, entry), os.path.join(obfdist, entry)]
 
-    options = ['-y']
-    options.extend(datas)
-    options.extend(scripts)
+def _pyi_makespec(obfdist, src, entry, packcmd):
+    # options = ['-y']
+    # s = os.pathsep
+    # d = obfdist
+    # datas = [
+    #     '--add-data', '%s%s.' % (os.path.join(d, 'pytransform.key'), s),
+    #     '--add-binary', '%s%s.' % (os.path.join(d, '_pytransform.*'), s)
+    # ]
+    # if not nolicense:
+    #     datas.append('--add-data')
+    #     datas.append('%s%s.' % (os.path.join(d, 'license.lic'), s))
+    # options.extend(datas)
+    #
+    # scripts = [os.path.join(src, entry), os.path.join(obfdist, entry)]
+    # options.extend(scripts)
 
+    options = ['-y', '-p', obfdist, '--hidden-import', 'pytransform',
+               '--additional-hooks-dir', obfdist, os.path.join(src, entry)]
     run_command([sys.executable] + packcmd + options)
 
 
-def update_specfile(project, obfdist, src, entry, specfile):
+def _patch_specfile(obfdist, src, specfile):
     with open(specfile) as f:
         lines = f.readlines()
 
     p = os.path.abspath(obfdist)
     patched_lines = (
         "", "# Patched by PyArmor",
-        "a.scripts[-1] = '%s', r'%s', 'PYSOURCE'" % (
-            entry[:-3], os.path.join(obfdist, entry)),
+        "_src = %s" % repr(os.path.abspath(src)),
+        "for i in range(len(a.scripts)):",
+        "    if a.scripts[i][1].startswith(_src):",
+        "        x = a.scripts[i][1].replace(_src, r'%s')" % p,
+        "        if os.path.exists(x):",
+        "            a.scripts[i] = a.scripts[i][0], x, a.scripts[i][2]",
         "for i in range(len(a.pure)):",
-        "    if a.pure[i][1].startswith(a.pathex[0]):",
-        "        x = a.pure[i][1].replace(a.pathex[0], r'%s')" % p,
+        "    if a.pure[i][1].startswith(_src):",
+        "        x = a.pure[i][1].replace(_src, r'%s')" % p,
         "        if os.path.exists(x):",
         "            if hasattr(a.pure, '_code_cache'):",
         "                with open(x) as f:",
@@ -272,10 +287,10 @@ def update_specfile(project, obfdist, src, entry, specfile):
 
     for i in range(len(lines)):
         if lines[i].startswith("pyz = PYZ(a.pure"):
+            lines[i:i] = '\n'.join(patched_lines)
             break
     else:
         raise RuntimeError('Unsupport specfile, no PYZ line found')
-    lines[i:i] = '\n'.join(patched_lines)
 
     patched_file = specfile[:-5] + '-patched.spec'
     with open(patched_file, 'w') as f:
@@ -284,36 +299,76 @@ def update_specfile(project, obfdist, src, entry, specfile):
     return os.path.normpath(patched_file)
 
 
-def _pyinstaller(src, entry, output, specfile, options, xoptions, args):
+def _pyinstaller(src, entry, output, options, xoptions, args):
     clean = args.clean
     nolicense = args.without_license
+    licfile = args.with_license
     src = relpath(src)
     output = relpath(output)
+    obfdist = os.path.join(output, 'obf')
     packcmd = DEFAULT_PACKER['PyInstaller'][2] + [output] + options
+    script = os.path.join(src, entry)
 
-    project = os.path.join(output, 'obf')
-    obfdist = os.path.join(project, 'dist')
+    if not script.endswith('.py') or not os.path.exists(script):
+        raise RuntimeError('No entry script %s found' % script)
+
+    if args.name:
+        packcmd.extend(['--name', args.name])
+    else:
+        args.name = os.path.basename(entry)[:-3]
+
+    specfile = args.setup
     if specfile is None:
-        specfile = os.path.join(os.path.basename(entry)[:-3] + '.spec')
+        specfile = os.path.join(args.name + '.spec')
+        if hasattr(args, 'project'):
+            specpath = args.project
+            if specpath.endswith('.json'):
+                specpath = os.path.dirname(specpath)
+            packcmd.extend(['--specpath', specpath])
+            specfile = os.path.join(specpath, specfile)
+    elif not os.path.exists(specfile):
+        raise RuntimeError('No specfile %s found' % specfile)
 
-    logging.info('build path: %s', relpath(project))
-    if clean and os.path.exists(project):
+    logging.info('build path: %s', relpath(obfdist))
+    if clean and os.path.exists(obfdist):
         logging.info('Remove build path')
-        shutil.rmtree(project)
+        shutil.rmtree(obfdist)
 
     logging.info('Run PyArmor to obfuscate scripts...')
-    call_pyarmor(['obfuscate', '-r', '-O', obfdist, '--exclude', output]
-                 + xoptions + [os.path.join(src, entry)])
+    if hasattr(args, 'project'):
+        if xoptions:
+            logging.warning('Ignore xoptions as packing project')
+        call_pyarmor(['build', '-O', obfdist, '--package-runtime', '0',
+                      args.project])
+    else:
+        call_pyarmor(['obfuscate', '-r', '-O', obfdist, '--exclude', output,
+                      '--package-runtime', '0'] + xoptions + [script])
 
-    if clean or (not os.path.exists(specfile)):
+    if licfile:
+        logging.info('Copy license file %s to %s', licfile, obfdist)
+        shutil.copy2(licfile, os.path.join(obfdist, 'license.lic'))
+
+    obftemp = os.path.join(obfdist, 'temp')
+    if not os.path.exists(obftemp):
+        logging.info('Create temp path: %s', obftemp)
+        os.makedirs(obftemp)
+    shutil.copy(os.path.join(obfdist, 'pytransform.py'), obftemp)
+
+    hookfile = os.path.join(obftemp, 'hook-pytransform.py')
+    logging.info('Generate hook script: %s', hookfile)
+    _make_hook_pytransform(hookfile, obfdist, nolicense)
+
+    if args.setup is None:
         logging.info('Run PyInstaller to generate .spec file...')
-        run_pyi_makespec(project, obfdist, src, entry, packcmd, nolicense)
+        _pyi_makespec(obftemp, src, entry, packcmd)
+        if not os.path.exists(specfile):
+            raise RuntimeError('No specfile "%s" found', specfile)
         logging.info('Save .spec file to %s', specfile)
     else:
-        logging.info('Use cached .spec file: %s', specfile)
+        logging.info('Use customized .spec file: %s', specfile)
 
     logging.info('Patching .spec file...')
-    patched_spec = update_specfile(project, obfdist, src, entry, specfile)
+    patched_spec = _patch_specfile(obfdist, src, specfile)
     logging.info('Save patched .spec file to %s', patched_spec)
 
     logging.info('Run PyInstaller with patched .spec file...')
@@ -325,14 +380,42 @@ def _pyinstaller(src, entry, output, specfile, options, xoptions, args):
             os.remove(specfile)
         logging.info('Remove patched .spec file %s', patched_spec)
         os.remove(patched_spec)
-        logging.info('Remove build path %s', project)
-        shutil.rmtree(project)
+        logging.info('Remove build path %s', obfdist)
+        shutil.rmtree(obfdist)
+
+
+def _get_project_entry(project):
+    if project.endswith('.json'):
+        filename = project
+        path = os.path.dirname(project)
+    else:
+        path = project
+        filename = os.path.join(project, '.pyarmor_config')
+    if not os.path.exists(filename):
+        raise RuntimeError('No project %s found' % project)
+    with open(filename, 'r') as f:
+        obj = json_load(f)
+        src = obj['src']
+        if not src:
+            raise RuntimeError('No src in this project %s' % project)
+        if not os.path.isabs(src):
+            src = os.path.join(path, src)
+        if not os.path.exists(src):
+            raise RuntimeError('The project src %s does not exists' % project)
+        if not obj['entry']:
+            raise RuntimeError('No entry in this project %s' % project)
+        entry = obj['entry'].split(',')[0]
+    return src, entry
 
 
 def packer(args):
     t = args.type
-    src = os.path.abspath(os.path.dirname(args.entry[0]))
-    entry = os.path.basename(args.entry[0])
+    if args.entry[0].endswith('.py'):
+        src = os.path.abspath(os.path.dirname(args.entry[0]))
+        entry = os.path.basename(args.entry[0])
+    else:
+        src, entry = _get_project_entry(args.entry[0])
+        args.project = args.entry[0]
     extra_options = [] if args.options is None else split(args.options)
     xoptions = [] if args.xoptions is None else split(args.xoptions)
 
@@ -355,8 +438,9 @@ def packer(args):
     logging.info('src for searching scripts: %s', relpath(src))
 
     if t == 'PyInstaller':
-        _pyinstaller(src, entry, output, script, extra_options, xoptions, args)
+        _pyinstaller(src, entry, output, extra_options, xoptions, args)
     else:
+        logging.warning('Deprecated way, use PyInstaller instead')
         _packer(t, src, entry, build, script, output,
                 extra_options, xoptions, args.clean)
 
@@ -368,19 +452,23 @@ def add_arguments(parser):
     parser.add_argument('-v', '--version', action='version', version='v0.1')
 
     parser.add_argument('-t', '--type', default='PyInstaller', metavar='TYPE',
-                        choices=DEFAULT_PACKER.keys(),
-                        help=', '.join(DEFAULT_PACKER.keys()))
-    parser.add_argument('-s', '--setup', help=argparse.SUPPRESS)
-    parser.add_argument('-O', '--output',
+                        choices=DEFAULT_PACKER.keys(), help=argparse.SUPPRESS)
+    parser.add_argument('-s', '--setup', metavar='FILE',
+                        help='Use external .spec file to pack the script')
+    parser.add_argument('-n', '--name', help='Name to assign to the bundled '
+                        'app (default: first script’s basename)')
+    parser.add_argument('-O', '--output', metavar='PATH',
                         help='Directory to put final built distributions in')
-    parser.add_argument('-e', '--options',
-                        help='Extra options to run external tool')
-    parser.add_argument('-x', '--xoptions',
-                        help='Extra options to obfuscate scripts')
+    parser.add_argument('-e', '--options', metavar='EXTRA_OPTIONS',
+                        help='Pass these extra options to `pyinstaller`')
+    parser.add_argument('-x', '--xoptions', metavar='EXTRA_OPTIONS',
+                        help='Pass these extra options to `pyarmor obfuscate`')
     parser.add_argument('--without-license', action='store_true',
                         help='Do not generate license for obfuscated scripts')
+    parser.add_argument('--with-license', metavar='FILE',
+                        help='Use this license file other than default one')
     parser.add_argument('--clean', action="store_true",
-                        help='Remove build path before packing')
+                        help='Remove cached .spec file before packing')
     parser.add_argument('--debug', action="store_true",
                         help='Do not remove build files after packing')
     parser.add_argument('entry', metavar='SCRIPT', nargs=1,
